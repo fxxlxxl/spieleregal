@@ -461,7 +461,7 @@ const LBL='SERVICE wikibase:label{bd:serviceParam wikibase:language "de,en".}';
 const DATE_OPT='OPTIONAL{?item p:P577/psv:P577 ?tv.?tv wikibase:timeValue ?date;wikibase:timePrecision ?prec.}';
 
 /* Liste von Spielen nach Datum, Beliebtheit (Anzahl Wikipedia-Sprachen) und Plattform */
-function qList(o){
+function qList1(o){
   const f=[];
   if(o.from)f.push('?date >= '+dt0(o.from));
   if(o.to)f.push('?date < '+dt0(o.to));
@@ -478,7 +478,7 @@ function qList(o){
     '}GROUP BY ?item ORDER BY '+(o.asc?'ASC(?d)':'DESC(?sitelinks)')+' ?item LIMIT '+(o.limit||40)+(o.offset?' OFFSET '+o.offset:'');
 }
 /* Daten zu bekannten Spielen (Suche, Wunschliste) */
-function qEnrich(ids,needType){
+function qEnrich1(ids,needType){
   return'SELECT ?item (SAMPLE(?itemLabel) AS ?label) (MIN(?date) AS ?d) (MAX(?prec) AS ?pr) '+
     '(GROUP_CONCAT(DISTINCT ?pLabel;separator="¦") AS ?plats) (GROUP_CONCAT(DISTINCT ?gLabel;separator="¦") AS ?gens) WHERE{'+
     'VALUES ?item{'+ids.filter(isQ).map(i=>'wd:'+i).join(' ')+'}'+
@@ -486,7 +486,7 @@ function qEnrich(ids,needType){
     'OPTIONAL{?item wdt:P400 ?p.}OPTIONAL{?item wdt:P136 ?g.}'+LBL+'}GROUP BY ?item';
 }
 /* Alle Angaben für die Detailseite */
-function qDetail(id){
+function qDetail1(id){
   return'SELECT (SAMPLE(?itemLabel) AS ?label) (SAMPLE(?ti) AS ?title) (SAMPLE(?di) AS ?dtitle) (MIN(?date) AS ?d) (MAX(?prec) AS ?pr) '+
     '(GROUP_CONCAT(DISTINCT ?pLabel;separator="¦") AS ?plats) (GROUP_CONCAT(DISTINCT ?gLabel;separator="¦") AS ?gens) '+
     '(GROUP_CONCAT(DISTINCT ?devLabel;separator="¦") AS ?devs) (GROUP_CONCAT(DISTINCT ?pbLabel;separator="¦") AS ?pubs) (SAMPLE(?web) AS ?site) WHERE{'+
@@ -496,10 +496,75 @@ function qDetail(id){
     'OPTIONAL{?b schema:about ?item;schema:isPartOf <https://de.wikipedia.org/>;schema:name ?di.}'+
     LBL+'}';
 }
+/* --- Stufe 2: feste Bezeichnungen statt Label-Dienst, nur Erstveröffentlichungen, Zusatzbilder --- */
+let QLEVEL=2,L2OK=false,L2BAD=0,L2OFF=0;
+/* Bezeichnung in zwei Sprachen, die erste vorhandene gewinnt */
+const OL=(v,o,a,b)=>'OPTIONAL{'+v+' rdfs:label ?'+o+'a. FILTER(LANG(?'+o+'a)="'+a+'")} OPTIONAL{'+v+' rdfs:label ?'+o+'b. FILTER(LANG(?'+o+'b)="'+b+'")} BIND(COALESCE(?'+o+'a,?'+o+'b) AS ?'+o+') ';
+const AGG_PG='(GROUP_CONCAT(DISTINCT ?pl;separator="¦") AS ?plats) (GROUP_CONCAT(DISTINCT ?gl;separator="¦") AS ?gens)';
+const IMG_AGG='(SAMPLE(?im) AS ?img) (SAMPLE(?sid) AS ?steam)';
+const PGOPT='OPTIONAL{?item wdt:P400 ?p. '+OL('?p','pl','en','de')+'} OPTIONAL{?item wdt:P136 ?g. '+OL('?g','gl','de','en')+'} ';
+const ILOPT=OL('?item','il','de','en');
+const IMGOPT='OPTIONAL{?item wdt:P18 ?im.} OPTIONAL{?item wdt:P1733 ?sid.} ';
+const FROM_ARTICLE='?art schema:about ?item;schema:isPartOf <https://en.wikipedia.org/>;schema:name ?ti.';
+function qList(o){
+  const f=[];
+  if(o.from)f.push('?date >= '+dt0(o.from));
+  if(o.to)f.push('?date < '+dt0(o.to));
+  if(o.minPrec)f.push('?prec >= '+o.minPrec);
+  if(o.minSl)f.push('?sl >= '+o.minSl);
+  /* kein früherer Termin: sonst wären Portierungen und Neuauflagen alter Spiele dabei */
+  const first=o.from?'FILTER NOT EXISTS{?item p:P577 ?s2. ?s2 psv:P577 ?v2. ?v2 wikibase:timeValue ?early. FILTER(?early < '+dt0(o.from)+')} ':'';
+  const plat=o.plat?'FILTER EXISTS{?item wdt:P400 ?pf.?pf rdfs:label ?pfl.FILTER(LANG(?pfl)="en" && REGEX(?pfl,"'+o.plat+'"))} ':'';
+  return'SELECT ?item (SAMPLE(?il) AS ?label) (SAMPLE(?ti) AS ?title) (MIN(?date) AS ?d) (MAX(?prec) AS ?pr) (MAX(?sl) AS ?sitelinks) '+IMG_AGG+' '+AGG_PG+' WHERE{'+
+    '?item wdt:P31 wd:Q7889;wikibase:sitelinks ?sl;p:P577/psv:P577 ?tv. '+
+    '?tv wikibase:timeValue ?date;wikibase:timePrecision ?prec. '+FROM_ARTICLE+' '+
+    (f.length?'FILTER('+f.join(' && ')+') ':'')+first+plat+PGOPT+ILOPT+IMGOPT+
+    '}GROUP BY ?item ORDER BY '+(o.asc?'ASC(?d)':'DESC(?sitelinks)')+' ?item LIMIT '+(o.limit||40)+(o.offset?' OFFSET '+o.offset:'');
+}
+function qEnrich(ids,needType){
+  return'SELECT ?item (SAMPLE(?il) AS ?label) (MIN(?date) AS ?d) (MAX(?prec) AS ?pr) '+IMG_AGG+' '+AGG_PG+' WHERE{'+
+    'VALUES ?item{'+ids.filter(isQ).map(i=>'wd:'+i).join(' ')+'} '+
+    (needType?'?item wdt:P31 wd:Q7889. ':'')+DATE_OPT+' '+PGOPT+ILOPT+IMGOPT+'}GROUP BY ?item';
+}
+function qDetail(id){
+  return'SELECT (SAMPLE(?il) AS ?label) (SAMPLE(?ti) AS ?title) (SAMPLE(?di) AS ?dtitle) (MIN(?date) AS ?d) (MAX(?prec) AS ?pr) '+IMG_AGG+' '+AGG_PG+' '+
+    '(GROUP_CONCAT(DISTINCT ?dvl;separator="¦") AS ?devs) (GROUP_CONCAT(DISTINCT ?pbl;separator="¦") AS ?pubs) (SAMPLE(?web) AS ?site) WHERE{'+
+    'BIND(wd:'+id+' AS ?item) '+DATE_OPT+' '+PGOPT+
+    'OPTIONAL{?item wdt:P178 ?dev. '+OL('?dev','dvl','de','en')+'} OPTIONAL{?item wdt:P123 ?pb. '+OL('?pb','pbl','de','en')+'} OPTIONAL{?item wdt:P856 ?web.} '+
+    'OPTIONAL{?a schema:about ?item;schema:isPartOf <https://en.wikipedia.org/>;schema:name ?ti.} OPTIONAL{?b schema:about ?item;schema:isPartOf <https://de.wikipedia.org/>;schema:name ?di.} '+
+    ILOPT+IMGOPT+'}';
+}
+/* nur Titel und Zusatzbilder (für Bibliothekseinträge ohne Cover) */
+function qCovers(ids,withImg){
+  return'SELECT ?item (SAMPLE(?ti) AS ?title) '+(withImg?IMG_AGG+' ':'')+'WHERE{VALUES ?item{'+ids.filter(isQ).map(i=>'wd:'+i).join(' ')+'} '+
+    'OPTIONAL{'+FROM_ARTICLE+'} '+(withImg?IMGOPT:'')+'}GROUP BY ?item';
+}
+/* Stufe 2 zuerst, bei Fehlern die bewährte Stufe 1 */
+async function sparqlLv(q2,q1,signal){
+  if(QLEVEL===2&&Date.now()>=L2OFF){
+    let err;
+    try{const r=await sparql(q2(),signal);L2OK=true;return r}
+    catch(e){if(!e||e.name==='AbortError'||e.code==='RATE')throw e;err=e}
+    const r=await sparql(q1(),signal);
+    if(!L2OK){L2BAD++;L2OFF=Date.now()+(err.code==='HTTP400'||L2BAD>=2?24*36e5:5*6e4);if(err.code==='HTTP400'||L2BAD>=3)QLEVEL=1}
+    return r;
+  }
+  return sparql(q1(),signal);
+}
+/* Cover-Kette: Wikipedia, danach Steam, danach Wikidata-Bild */
+const STEAM=id=>/^\d{1,9}$/.test(String(id||''))?['https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/'+id+'/library_600x900.jpg','https://cdn.cloudflare.steamstatic.com/steam/apps/'+id+'/library_600x900.jpg']:[];
+const commonsImg=u=>/^https?:\/\/commons\.wikimedia\.org\/wiki\/Special:FilePath\//i.test(String(u||''))?String(u).replace(/^http:/i,'https:')+'?width=520':'';
+const extraImgs=b=>STEAM(bv(b,'steam')).concat([commonsImg(bv(b,'img'))]).filter(Boolean);
+function applyImgs(g,wiki,ex){const l=[...new Set([wiki].concat(ex||[]).filter(Boolean))];g.image=l[0]||'';g.alt=l.slice(1);delete g.ex;return g}
+const imgList=g=>[...new Set([g.image].concat(g.alt||[]).filter(Boolean))];
+function imgTag(g,cls,alt,more){
+  const l=imgList(g);if(!l.length)return'';
+  return'<img'+(cls?' class="'+cls+'"':'')+' src="'+esc(l[0])+'"'+(l.length>1?' data-alt="'+esc(l.slice(1).join(' '))+'"':'')+' alt="'+esc(alt||'')+'"'+(more||'')+'>';
+}
 function rowGame(b){
   const id=qidOf(bv(b,'item'));if(!isQ(id))return null;
   const title=bv(b,'title'),label=bv(b,'label');
-  return{id,name:(label&&!isQ(label))?label:cleanTitle(title),title,image:'',released:dOf(bv(b,'d')),prec:Number(bv(b,'pr'))||11,
+  return{id,name:(label&&!isQ(label))?label:cleanTitle(title),title,image:'',ex:extraImgs(b),released:dOf(bv(b,'d')),prec:Number(bv(b,'pr'))||11,
     platforms:splitL(bv(b,'plats')),genres:splitL(bv(b,'gens'))};
 }
 /* Cover: das Titelbild des Wikipedia-Artikels ist bei Spielen das Cover */
@@ -507,7 +572,7 @@ async function wpCovers(titles,signal){
   const out={};const u=[...new Set(titles.filter(Boolean))];
   for(let i=0;i<u.length;i+=40){
     const part=u.slice(i,i+40);
-    const d=await wp('en',{prop:'pageimages',piprop:'thumbnail',pithumbsize:'520',pilimit:'max',redirects:'1',titles:part.join('|')},signal);
+    const d=await wp('en',{prop:'pageimages',piprop:'thumbnail',pilicense:'any',pithumbsize:'520',pilimit:'max',redirects:'1',titles:part.join('|')},signal);
     const q=d.query||{};
     const nm=new Map((q.normalized||[]).map(x=>[x.from,x.to]));
     const rd=new Map((q.redirects||[]).map(x=>[x.from,x.to]));
@@ -517,7 +582,7 @@ async function wpCovers(titles,signal){
   return out;
 }
 async function wpExtract(lang,title,signal){
-  const d=await wp(lang,{prop:'extracts|pageimages',exintro:'1',explaintext:'1',redirects:'1',piprop:'thumbnail',pithumbsize:'900',titles:title},signal);
+  const d=await wp(lang,{prop:'extracts|pageimages',exintro:'1',explaintext:'1',redirects:'1',piprop:'thumbnail',pilicense:'any',pithumbsize:'900',titles:title},signal);
   const p=((d.query||{}).pages||[])[0];
   if(!p||p.missing)return null;
   return{text:String(p.extract||'').trim(),image:(p.thumbnail&&p.thumbnail.source)||''};
@@ -528,27 +593,29 @@ async function wpSearch(q,offset,signal,strict){
   const last=words.pop();
   const term=words.concat(last.length>=3?[last+'*']:[last]).join(' ');
   const d=await wp('en',{generator:'search',gsrsearch:term+(strict?' hastemplate:"Infobox video game"':' video game'),gsrlimit:'20',gsroffset:String(offset||0),gsrnamespace:'0',
-    prop:'pageimages|pageprops',piprop:'thumbnail',pithumbsize:'520',pilimit:'max',ppprop:'wikibase_item'},signal);
+    prop:'pageimages|pageprops',piprop:'thumbnail',pilicense:'any',pithumbsize:'520',pilimit:'max',ppprop:'wikibase_item'},signal);
   const pages=((d.query||{}).pages||[]).slice().sort((a,b)=>(a.index||0)-(b.index||0));
   return{items:pages.map(p=>({title:p.title,qid:(p.pageprops&&p.pageprops.wikibase_item)||'',image:(p.thumbnail&&p.thumbnail.source)||''})).filter(x=>isQ(x.qid)),
     more:!!(d.continue&&d.continue.gsroffset!=null)};
 }
 async function enrichMap(ids,needType,signal){
-  const rows=await sparql(qEnrich(ids,needType),signal);const out={};
-  rows.forEach(b=>{const id=qidOf(bv(b,'item'));out[id]={label:bv(b,'label'),released:dOf(bv(b,'d')),prec:Number(bv(b,'pr'))||11,platforms:splitL(bv(b,'plats')),genres:splitL(bv(b,'gens'))}});
+  const rows=await sparqlLv(()=>qEnrich(ids,needType),()=>qEnrich1(ids,needType),signal);const out={};
+  rows.forEach(b=>{const id=qidOf(bv(b,'item'));out[id]={label:bv(b,'label'),released:dOf(bv(b,'d')),prec:Number(bv(b,'pr'))||11,platforms:splitL(bv(b,'plats')),genres:splitL(bv(b,'gens')),ex:extraImgs(b)}});
   return out;
 }
 function toGame(x,m){
   m=m||{};
-  return{id:x.qid,name:(m.label&&!isQ(m.label))?m.label:cleanTitle(x.title),title:x.title,image:x.image||'',released:m.released||'',prec:m.prec||11,tba:false,platforms:m.platforms||[],genres:m.genres||[]};
+  return applyImgs({id:x.qid,name:(m.label&&!isQ(m.label))?m.label:cleanTitle(x.title),title:x.title,released:m.released||'',prec:m.prec||11,tba:false,platforms:m.platforms||[],genres:m.genres||[]},x.image,m.ex);
 }
 async function liveList(o,signal){
-  const rows=await sparql(qList(o),signal);
+  const rows=await sparqlLv(()=>qList(o),()=>qList1(o),signal);
   const items=rows.map(rowGame).filter(Boolean);
+  let im={};
   if(items.length){
-    try{const im=await wpCovers(items.map(i=>i.title),signal);items.forEach(i=>{i.image=im[i.title]||''})}
+    try{im=await wpCovers(items.map(i=>i.title),signal)}
     catch(e){if(e&&e.name==='AbortError')throw e}
   }
+  items.forEach(i=>applyImgs(i,im[i.title],i.ex));
   return items;
 }
 async function liveDiscover(){
@@ -583,7 +650,7 @@ async function liveSearch(q,page,f,signal){
   return{games,next:r.more};
 }
 async function liveDetail(id){
-  const rows=await sparql(qDetail(id));
+  const rows=await sparqlLv(()=>qDetail(id),()=>qDetail1(id));
   const b=rows[0]||{};
   const title=bv(b,'title'),dtitle=bv(b,'dtitle'),label=bv(b,'label');
   if(!title&&!dtitle&&(!label||isQ(label)))throw mkErr('NOTFOUND');
@@ -598,9 +665,9 @@ async function liveDetail(id){
     developers:splitL(bv(b,'devs')),publishers:splitL(bv(b,'pubs')),website:/^https?:\/\//i.test(site)?site:'',
     wiki:dtitle?'https://de.wikipedia.org/wiki/'+encodeURIComponent(dtitle.replace(/ /g,'_')):(title?'https://en.wikipedia.org/wiki/'+encodeURIComponent(title.replace(/ /g,'_')):'')};
   out.allPlatforms=out.platforms;
-  const img=(en&&en.image)||(de&&de.image)||'';if(img)out.image=img;
+  applyImgs(out,(en&&en.image)||(de&&de.image)||'',extraImgs(b));
   ['released','name'].forEach(k=>{if(!out[k])delete out[k]});
-  ['platforms','genres','allPlatforms'].forEach(k=>{if(!out[k].length)delete out[k]});
+  ['platforms','genres','allPlatforms','alt'].forEach(k=>{if(!out[k]||!out[k].length)delete out[k]});if(!out.image)delete out.image;
   return out;
 }
 
@@ -818,13 +885,13 @@ async function viaSource(live,off){
   }
 }
 const srcDiscover=force=>viaSource(async()=>{
-  const k='disc|'+todayIso();
+  const k='disc2|'+todayIso();
   if(!force){const c=cacheGet(k,6*36e5,true);if(c){[...c.soon,...c.fresh,...c.top].forEach(rem);return c}}
   const r=await liveDiscover();[...r.soon,...r.fresh,...r.top].forEach(rem);cacheSet(k,r,true);return r;
 },()=>offDiscover());
 const srcSearch=(q,f,page,signal)=>viaSource(()=>liveSearch(q,page,f,signal),()=>offSearch(q,f,page));
 const srcUpcoming=(f,page,signal)=>viaSource(async()=>{
-  const k='up|'+f+'|'+page+'|'+todayIso();
+  const k='up2|'+f+'|'+page+'|'+todayIso();
   const c=cacheGet(k,30*60*1000,false);if(c){c.games.forEach(rem);return c}
   const r=await liveUpcoming(f,page,signal);r.games.forEach(rem);cacheSet(k,r,false);return r;
 },()=>offUpcoming(f,page));
@@ -833,15 +900,15 @@ async function getDetail(id){
   const isOff=String(id).startsWith('o:');
   const d=await viaSource(()=>isOff?offDetail(id):liveDetail(id),()=>offDetail(id));
   detailCache.set(id,d);
-  rem({id:d.id,name:d.name,image:d.image,released:d.released,prec:d.prec,platforms:d.platforms,genres:d.genres});
+  rem({id:d.id,name:d.name,image:d.image,alt:d.alt,released:d.released,prec:d.prec,platforms:d.platforms,genres:d.genres});
   return d;
 }
 function retryLive(){
-  MODE='live';liveOk=false;mem.clear();detailCache.clear();
+  MODE='live';liveOk=false;QLEVEL=2;L2BAD=0;L2OFF=0;mem.clear();detailCache.clear();
   D.loaded=0;D.err=null;U.games=[];U.done=false;S.games=[];S.done=false;
   paintAll();loadDiscover(true);
   if(S.q.trim()||S.f==='soon')runSearch(true);
-  refreshWishlist();
+  refreshWishlist();fillCovers();
 }
 
 /* ---------- Spielzustand ---------- */
@@ -882,8 +949,8 @@ function badge(g){
   const dt=pd(g.released);const same=dt.getFullYear()===new Date().getFullYear();
   return dt.toLocaleDateString('de-DE',same?{day:'numeric',month:'short'}:{month:'short',year:'numeric'});
 }
-const META=['name','image','released','prec','tba','platforms','genres'];
-const pickMeta=g=>{const o={};META.forEach(k=>{if(g[k]!==undefined)o[k]=g[k]});return o};
+const META=['name','title','image','alt','released','prec','tba','platforms','genres'];
+const pickMeta=g=>{const o={};META.forEach(k=>{const v=g[k];if(v===undefined)return;if((k==='image'||k==='alt'||k==='title')&&(!v||!v.length))return;o[k]=v});return o};
 function meta(id){const e=db.games[id];return Object.assign({id},e||{},known.get(id)||{},detailCache.get(id)||{})}
 function subline(g){return[g.released?yr(g.released):(g.tba?'TBA':''),(g.genres||[])[0]].filter(Boolean).join(' · ')}
 
@@ -894,6 +961,7 @@ function setStatus(g,st){
   if(st==='playing'&&!e.started)e.started=todayIso();
   if(st==='done'&&!e.finished)e.finished=todayIso();
   changed();
+  if(!imgList(e).length)fillCovers();
 }
 function patch(id,o){const e=db.games[id];if(!e)return;Object.assign(e,o);e.updated=Date.now();saveDb();paintAll(id)}
 function patchQuiet(id,o){const e=db.games[id];if(!e)return;Object.assign(e,o);e.updated=Date.now();saveDb()}
@@ -909,7 +977,7 @@ function syncMeta(d){
 
 /* ---------- Darstellung: Bausteine ---------- */
 function cover(g,cls,inner){
-  const img=g.image?`<img src="${esc(g.image)}" alt="" loading="lazy" decoding="async">`:'';
+  const img=imgTag(g,'','',' loading="lazy" decoding="async"');
   return`<div class="cover ${cls||''}" style="--h:${hueOf(g.id)}"><span class="mono"><i>${esc(g.name)}</i></span>${img}${inner||''}</div>`;
 }
 function pills(list,max){
@@ -1045,7 +1113,7 @@ function paintDiscover(){
   if(hero){
     const e=db.games[hero.id];
     const pl=[...new Set((hero.platforms||[]).map(shortPlat))].slice(0,3).join(', ');
-    h+=`<article class="hero" style="--h:${hueOf(hero.id)}">${hero.image?`<img class="hero-bg" src="${esc(hero.image)}" alt="">`:''}<div class="hero-shade"></div><div class="hero-in"><a class="hero-poster" href="#game-${esc(hid(hero.id))}" aria-label="${esc(hero.name)}">${cover(hero,'r34')}</a><div class="hero-t"><a class="hero-link" href="#game-${esc(hid(hero.id))}"><span class="chipwhen">${esc(whenText(hero)||'Demnächst')}</span><h2>${esc(hero.name)}</h2><p>${esc(relLong(hero))}${pl?' · '+esc(pl):''}</p></a><button class="btn ${e?'':'primary'} small" data-act="quick" data-id="${esc(hero.id)}">${e?STATUS[e.status].icon+esc(STATUS[e.status].label):IC.bookmark+'Vormerken'}</button></div></div></article>`;
+    h+=`<article class="hero" style="--h:${hueOf(hero.id)}">${imgTag(hero,'hero-bg','')}<div class="hero-shade"></div><div class="hero-in"><a class="hero-poster" href="#game-${esc(hid(hero.id))}" aria-label="${esc(hero.name)}">${cover(hero,'r34')}</a><div class="hero-t"><a class="hero-link" href="#game-${esc(hid(hero.id))}"><span class="chipwhen">${esc(whenText(hero)||'Demnächst')}</span><h2>${esc(hero.name)}</h2><p>${esc(relLong(hero))}${pl?' · '+esc(pl):''}</p></a><button class="btn ${e?'':'primary'} small" data-act="quick" data-id="${esc(hero.id)}">${e?STATUS[e.status].icon+esc(STATUS[e.status].label):IC.bookmark+'Vormerken'}</button></div></div></article>`;
   }
   const wl=Object.values(db.games).filter(g=>g.status==='wish').map(g=>meta(g.id));
   const radar=wl.filter(g=>unreleased(g)).sort(byDate).slice(0,12);
@@ -1062,7 +1130,7 @@ async function loadDiscover(force){
   paintDiscover();
   try{
     const r=await srcDiscover(force);
-    D.hero=r.soon.find(g=>g.image)||r.soon[0]||null;
+    D.hero=r.soon.find(g=>imgList(g).length)||r.soon[0]||null;
     D.soon=r.soon.filter(g=>g!==D.hero).sort(byDate);
     D.fresh=r.fresh;D.top=r.top;D.loaded=Date.now();
   }catch(e){
@@ -1247,7 +1315,7 @@ function paintGame(l){
   const when=g.released?(unreleased(g)?'Erscheint ':'Erschienen ')+relLong(g):(g.tba?'Erscheinungstermin offen':'');
   const wt=unreleased(g)&&pc_(g)>=10?whenText(g):'';
   const plats=(d&&d.allPlatforms&&d.allPlatforms.length?d.allPlatforms:g.platforms)||[];
-  root.innerHTML=`<div class="g-hero" style="--h:${hueOf(id)}">${g.image?`<img class="bg" src="${esc(g.image)}" alt="">`:''}<div class="g-poster">${g.image?`<img src="${esc(g.image)}" alt="Cover von ${esc(g.name)}" decoding="async">`:cover(g,'r34')}</div></div>
+  root.innerHTML=`<div class="g-hero" style="--h:${hueOf(id)}">${imgTag(g,'bg','')}<div class="g-poster">${imgList(g).length?imgTag(g,'','Cover von '+(g.name||''),' decoding="async"'):cover(g,'r34')}</div></div>
 <div class="g-head"><h1>${esc(g.name||'Spiel')}</h1><div class="g-meta">${when?`<span>${esc(when)}</span>`:''}${wt?`<span class="when">${esc(wt)}</span>`:''}</div>${pills(plats,6)}</div>
 <div data-trk="${esc(id)}">${trackHTML(id)}</div>
 <div class="panel" data-inf="${esc(id)}">${infoHTML(id,l)}</div>
@@ -1339,12 +1407,46 @@ async function refreshWishlist(){
   }catch(e){}
 }
 
+/* ---------- Cover für Bibliothekseinträge nachtragen ---------- */
+let fillBusy=false,fillAgain=false;
+async function fillCovers(){
+  if(MODE!=='live')return;
+  if(fillBusy){fillAgain=true;return}
+  const now=Date.now();
+  const miss=Object.values(db.games).filter(g=>isQ(g.id)&&!imgList(g).length&&now-(g.imgTry||0)>7*864e5).slice(0,40);
+  if(!miss.length)return;
+  fillBusy=true;
+  try{
+    const ids=miss.map(g=>g.id);let rows;
+    try{rows=await sparql(qCovers(ids,true))}
+    catch(e){if(e&&(e.code==='NET'||e.code==='RATE'||e.code==='TIMEOUT'))throw e;rows=await sparql(qCovers(ids,false))}
+    const by={};rows.forEach(b=>{by[qidOf(bv(b,'item'))]={title:bv(b,'title'),ex:extraImgs(b)}});
+    let wiki={},wOk=true;
+    try{wiki=await wpCovers(Object.values(by).map(x=>x.title))}catch(e){wOk=false}
+    miss.forEach(g=>{
+      const e=db.games[g.id];if(!e)return;
+      const x=by[g.id]||{title:'',ex:[]};
+      applyImgs(e,wiki[x.title],x.ex);
+      if(x.title&&!e.title)e.title=x.title;
+      if(wOk||imgList(e).length)e.imgTry=now;
+    });
+    saveDb();paintAll();
+  }catch(e){}
+  finally{fillBusy=false;if(fillAgain){fillAgain=false;setTimeout(fillCovers,800)}}
+}
+
 /* ---------- Ereignisse ---------- */
 document.addEventListener('error',e=>{
   const t=e.target;
   if(t&&t.tagName==='IMG'){
-    if(t.dataset.orig&&!t.dataset.fb){t.dataset.fb='1';t.src=t.dataset.orig}
-    else t.classList.add('broken');
+    const al=(t.dataset.alt||'').split(' ').filter(Boolean);
+    if(al.length){t.src=al.shift();t.dataset.alt=al.join(' ')}
+    else if(t.dataset.orig&&!t.dataset.fb){t.dataset.fb='1';t.src=t.dataset.orig}
+    else{
+      const gp=t.closest('.g-poster'),rt=t.closest('[data-gid]');
+      if(gp&&rt)gp.innerHTML=cover(Object.assign({},meta(rt.dataset.gid),{image:'',alt:[]}),'r34');
+      else t.classList.add('broken');
+    }
   }
 },true);
 
@@ -1518,6 +1620,7 @@ if(location.hash&&!TABS.includes(startHash))route();
 firstRoute=false;
 loadDiscover();
 refreshWishlist();
+fillCovers();
 document.addEventListener('visibilitychange',()=>{
   if(document.visibilityState==='visible'&&D.loaded&&Date.now()-D.loaded>30*60*1000)loadDiscover(true);
 });
