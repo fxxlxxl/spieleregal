@@ -439,6 +439,7 @@ const WD='https://query.wikidata.org/sparql';
 const wpUrl=l=>'https://'+l+'.wikipedia.org/w/api.php';
 let MODE='live',liveOk=false;
 const known=new Map();            // id -> Metadaten aus Listen
+let CATIDX=null,CATREV=-1,covRev=0;
 const detailCache=new Map();      // id -> Details
 const mem=new Map();
 const mkErr=c=>Object.assign(new Error(c),{code:c});
@@ -472,7 +473,7 @@ function errText(e){
     default:return'Keine Verbindung zur Spieldatenbank. Prüfe dein Netz und versuche es erneut.';
   }
 }
-const rem=g=>{const o={};Object.keys(g).forEach(k=>{const v=g[k];if(v!==''&&v!=null&&!(Array.isArray(v)&&!v.length))o[k]=v});known.set(g.id,Object.assign({},known.get(g.id),o))};
+const rem=g=>{catFix(g);const o={};Object.keys(g).forEach(k=>{const v=g[k];if(v!==''&&v!=null&&!(Array.isArray(v)&&!v.length))o[k]=v});known.set(g.id,Object.assign({},known.get(g.id),o))};
 function cacheGet(k,ttl,persist){
   let p=mem.get(k);
   if(!p&&persist){try{const raw=lsGet('sr.c.'+hash(k));if(raw)p=JSON.parse(raw)}catch(e){}}
@@ -495,9 +496,19 @@ const isQ=s=>/^Q\d+$/.test(String(s||''));
 const cleanTitle=t=>String(t||'').replace(/\s*\((?:[^()]*\s)?(?:video )?game\)$/i,'');
 const splitL=s=>s?[...new Set(String(s).split('¦').map(x=>x.trim()).filter(x=>x&&!isQ(x)))]:[];
 const dOf=v=>/^\d{4}-\d{2}-\d{2}/.test(v||'')?v.slice(0,10):'';
+/* Wikidata führt oft mehrere Termine (alte Platzhalter wie "2025" neben dem echten Tag). dm = frühester Termin mit eigener Genauigkeit,
+   dk = der genaueste Termin. Der genaue gewinnt, wenn er höchstens 4 Jahre nach dem frühesten liegt. */
+function dpOf(b){
+  const sp=k=>{const v=bv(b,k),i=v.indexOf('|');return i<0?null:[v.slice(0,i),v.slice(i+1)]};
+  const m=sp('dm'),k=sp('dk');
+  const A=m&&dOf(m[0])?{released:dOf(m[0]),prec:Number(m[1])||11}:{released:dOf(bv(b,'d')),prec:Number(bv(b,'pr'))||11};
+  const B=k&&dOf(k[1])?{released:dOf(k[1]),prec:100-Number(k[0])}:null;
+  if(B&&B.prec>A.prec&&(!A.released||(B.released>=A.released&&+B.released.slice(0,4)-+A.released.slice(0,4)<=4)))return B;
+  return A;
+}
 const dt0=s=>'"'+s+'T00:00:00Z"^^xsd:dateTime';
 const LBL='SERVICE wikibase:label{bd:serviceParam wikibase:language "de,en".}';
-const DATE_OPT='OPTIONAL{?item p:P577/psv:P577 ?tv.?tv wikibase:timeValue ?date;wikibase:timePrecision ?prec.}';
+const DATE_OPT='OPTIONAL{?item p:P577/psv:P577 ?tv.?tv wikibase:timeValue ?date;wikibase:timePrecision ?prec.}BIND(CONCAT(STR(?date),"|",STR(?prec)) AS ?dm0) BIND(CONCAT(STR(100-?prec),"|",STR(?date)) AS ?dk0) ';
 
 /* Liste von Spielen nach Datum, Beliebtheit (Anzahl Wikipedia-Sprachen) und Plattform */
 function qList1(o){
@@ -518,7 +529,7 @@ function qList1(o){
 }
 /* Daten zu bekannten Spielen (Suche, Wunschliste) */
 function qEnrich1(ids,needType){
-  return'SELECT ?item (SAMPLE(?itemLabel) AS ?label) (MIN(?date) AS ?d) (MAX(?prec) AS ?pr) '+
+  return'SELECT ?item (SAMPLE(?itemLabel) AS ?label) (MIN(?date) AS ?d) (MAX(?prec) AS ?pr) (MIN(?dm0) AS ?dm) (MIN(?dk0) AS ?dk) '+
     '(GROUP_CONCAT(DISTINCT ?pLabel;separator="¦") AS ?plats) (GROUP_CONCAT(DISTINCT ?gLabel;separator="¦") AS ?gens) WHERE{'+
     'VALUES ?item{'+ids.filter(isQ).map(i=>'wd:'+i).join(' ')+'}'+
     (needType?'?item wdt:P31 wd:Q7889.':'')+DATE_OPT+
@@ -526,7 +537,7 @@ function qEnrich1(ids,needType){
 }
 /* Alle Angaben für die Detailseite */
 function qDetail1(id){
-  return'SELECT (SAMPLE(?itemLabel) AS ?label) (SAMPLE(?ti) AS ?title) (SAMPLE(?di) AS ?dtitle) (MIN(?date) AS ?d) (MAX(?prec) AS ?pr) '+
+  return'SELECT (SAMPLE(?itemLabel) AS ?label) (SAMPLE(?ti) AS ?title) (SAMPLE(?di) AS ?dtitle) (MIN(?date) AS ?d) (MAX(?prec) AS ?pr) (MIN(?dm0) AS ?dm) (MIN(?dk0) AS ?dk) '+
     '(GROUP_CONCAT(DISTINCT ?pLabel;separator="¦") AS ?plats) (GROUP_CONCAT(DISTINCT ?gLabel;separator="¦") AS ?gens) '+
     '(GROUP_CONCAT(DISTINCT ?devLabel;separator="¦") AS ?devs) (GROUP_CONCAT(DISTINCT ?pbLabel;separator="¦") AS ?pubs) (SAMPLE(?web) AS ?site) WHERE{'+
     'BIND(wd:'+id+' AS ?item)'+DATE_OPT+
@@ -563,12 +574,12 @@ function qList(o){
   return'SELECT ?item (SAMPLE(?il) AS ?label) (SAMPLE(?ti) AS ?title) (MIN(?date) AS ?d) (MAX(?prec) AS ?pr) (MAX(?sl) AS ?sitelinks) '+IMG_AGG+' '+AGG_PG+' WHERE{'+core+PGOPT+ILOPT+IMGOPT+tail;
 }
 function qEnrich(ids,needType){
-  return'SELECT ?item (SAMPLE(?il) AS ?label) (MIN(?date) AS ?d) (MAX(?prec) AS ?pr) '+IMG_AGG+' '+AGG_PG+' WHERE{'+
+  return'SELECT ?item (SAMPLE(?il) AS ?label) (MIN(?date) AS ?d) (MAX(?prec) AS ?pr) (MIN(?dm0) AS ?dm) (MIN(?dk0) AS ?dk) '+IMG_AGG+' '+AGG_PG+' WHERE{'+
     'VALUES ?item{'+ids.filter(isQ).map(i=>'wd:'+i).join(' ')+'} '+
     (needType?'?item wdt:P31 wd:Q7889. ':'')+DATE_OPT+' '+PGOPT+ILOPT+IMGOPT+'}GROUP BY ?item';
 }
 function qDetail(id){
-  return'SELECT (SAMPLE(?il) AS ?label) (SAMPLE(?ti) AS ?title) (SAMPLE(?di) AS ?dtitle) (MIN(?date) AS ?d) (MAX(?prec) AS ?pr) '+IMG_AGG+' '+AGG_PG+' '+
+  return'SELECT (SAMPLE(?il) AS ?label) (SAMPLE(?ti) AS ?title) (SAMPLE(?di) AS ?dtitle) (MIN(?date) AS ?d) (MAX(?prec) AS ?pr) (MIN(?dm0) AS ?dm) (MIN(?dk0) AS ?dk) '+IMG_AGG+' '+AGG_PG+' '+
     '(GROUP_CONCAT(DISTINCT ?dvl;separator="¦") AS ?devs) (GROUP_CONCAT(DISTINCT ?pbl;separator="¦") AS ?pubs) (SAMPLE(?web) AS ?site) WHERE{'+
     'BIND(wd:'+id+' AS ?item) '+DATE_OPT+' '+PGOPT+
     'OPTIONAL{?item wdt:P178 ?dev. '+OL('?dev','dvl','de','en')+'} OPTIONAL{?item wdt:P123 ?pb. '+OL('?pb','pbl','de','en')+'} OPTIONAL{?item wdt:P856 ?web.} '+
@@ -661,7 +672,7 @@ async function wpSearch(q,offset,signal,strict){
 }
 async function enrichMap(ids,needType,signal){
   const rows=await sparqlLv(()=>qEnrich(ids,needType),()=>qEnrich1(ids,needType),signal);const out={};
-  rows.forEach(b=>{const id=qidOf(bv(b,'item'));out[id]={label:bv(b,'label'),released:dOf(bv(b,'d')),prec:Number(bv(b,'pr'))||11,platforms:splitL(bv(b,'plats')),genres:splitL(bv(b,'gens')),ex:extraImgs(b),steam:/^\d{1,9}$/.test(bv(b,'steam'))?bv(b,'steam'):''}});
+  rows.forEach(b=>{const id=qidOf(bv(b,'item')),dp=dpOf(b);out[id]={label:bv(b,'label'),released:dp.released,prec:dp.prec,platforms:splitL(bv(b,'plats')),genres:splitL(bv(b,'gens')),ex:extraImgs(b),steam:/^\d{1,9}$/.test(bv(b,'steam'))?bv(b,'steam'):''}});
   return out;
 }
 function toGame(x,m){
@@ -741,8 +752,8 @@ async function liveDetail(id){
     dtitle?wpExtract('de',dtitle).catch(()=>null):null,
     title?wpExtract('en',title).catch(()=>null):null
   ]);
-  const site=bv(b,'site');
-  const out={id,name:(label&&!isQ(label))?label:cleanTitle(title||dtitle),title,released:dOf(bv(b,'d')),prec:Number(bv(b,'pr'))||11,tba:false,
+  const site=bv(b,'site'),dp=dpOf(b);
+  const out={id,name:(label&&!isQ(label))?label:cleanTitle(title||dtitle),title,released:dp.released,prec:dp.prec,tba:false,
     platforms:splitL(bv(b,'plats')),genres:splitL(bv(b,'gens')),steam:/^\d{1,9}$/.test(bv(b,'steam'))?bv(b,'steam'):'',
     description:(de&&de.text)||(en&&en.text)||'',descLang:(de&&de.text)?'de':'en',
     developers:splitL(bv(b,'devs')),publishers:splitL(bv(b,'pubs')),website:/^https?:\/\//i.test(site)?site:'',
@@ -1230,6 +1241,45 @@ function offAll(){
   OFFC.forEach(rem);
   return OFFC;
 }
+/* Der eingebaute Katalog korrigiert Live-Daten: Wikidata führt manchmal alte Platzhalter-Termine und unvollständige Plattformen (z. B. bei GTA VI).
+   Gefunden wird ein Katalogspiel nur über seine Wikidata-Nummer, nie über den Namen (sonst würde "Fable" auf alle Fable-Spiele passen). */
+const platKey=p=>{p=String(p||'');return/xbox series/i.test(p)?'xsx':/playstation 5|^ps5$/i.test(p)?'ps5':/switch 2/i.test(p)?'ns2':/switch/i.test(p)?'nsw':/windows|^pc$/i.test(p)?'pc':p.toLowerCase()};
+function catOf(id){
+  try{
+    if(!id)return null;
+    if(!CATIDX||CATREV!==covRev){
+      CATIDX=new Map();
+      offAll().forEach(c=>{CATIDX.set(c.id,c);CATIDX.set(c.oid,c);const q=COV[c.oid]&&COV[c.oid].q;if(q)CATIDX.set(q,c)});
+      CATREV=covRev;
+    }
+    return CATIDX.get(id)||null;
+  }catch(e){return null}
+}
+function catFix(g){
+  const c=g&&catOf(g.id);
+  if(!c||c===g)return g;
+  const have=new Set((g.platforms||[]).map(platKey));
+  const add=(c.platforms||[]).filter(p=>!have.has(platKey(p)));
+  if(add.length)g.platforms=(g.platforms||[]).concat(add);
+  if(g.allPlatforms){const ha=new Set(g.allPlatforms.map(platKey)),ad=(c.platforms||[]).filter(p=>!ha.has(platKey(p)));if(ad.length)g.allPlatforms=g.allPlatforms.concat(ad)}
+  if(c.released&&(!g.released||pc_(g)<pc_(c)||(pc_(c)===11&&g.released<c.released))){g.released=c.released;g.prec=c.prec;g.tba=false}
+  return g;
+}
+/* Live-Listen um Katalogspiele ergänzen, die Wikidata mit unsauberem Termin führt und deshalb nicht liefert */
+function mergeCatalog(live,cat){
+  const ids=new Set(live.map(g=>g.id)),names=new Set(live.map(g=>nkey(g.name)).filter(Boolean));
+  return live.concat(cat.filter(g=>!ids.has(g.id)&&!names.has(nkey(g.name))));
+}
+function fixDbCat(){
+  let ch=false;
+  Object.values(db.games).forEach(e=>{
+    const t={id:e.id,released:e.released,prec:e.prec,tba:e.tba,platforms:e.platforms};
+    catFix(t);
+    if(t.released!==e.released||t.prec!==e.prec){e.released=t.released;e.prec=t.prec;e.tba=false;ch=true}
+    if((t.platforms||[]).length!==(e.platforms||[]).length){e.platforms=t.platforms;ch=true}
+  });
+  if(ch)saveDb();
+}
 const fold=s=>String(s).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'');
 const byDate=(a,b)=>String(a.released||'9999').localeCompare(String(b.released||'9999'));
 function offDiscover(){
@@ -1266,6 +1316,7 @@ const COVK='sr.cov1';
 let COV={};
 try{COV=JSON.parse(lsGet(COVK)||'{}')||{}}catch(e){COV={}}
 function covSave(){
+  covRev++;
   const ks=Object.keys(COV);
   if(ks.length>600)ks.sort((a,b)=>(COV[a].ts||0)-(COV[b].ts||0)).slice(0,ks.length-500).forEach(k=>delete COV[k]);
   lsSet(COVK,JSON.stringify(COV));
@@ -1402,7 +1453,7 @@ async function getDetail(id){
   if(c0&&!c0.partial)return c0;
   const isOff=String(id).startsWith('o:'),isSt=String(id).startsWith('s:');
   const d=isSt?await steamDetail(id):await viaSource(()=>isOff?offDetail(id):liveDetail(id),()=>offDetail(id));
-  detailCache.set(id,d);
+  catFix(d);detailCache.set(id,d);
   rem({id:d.id,name:d.name,image:d.image,alt:d.alt,released:d.released,prec:d.prec,tba:d.tba,platforms:d.platforms,genres:d.genres,steam:d.steam});
   return d;
 }
@@ -1454,7 +1505,7 @@ function badge(g){
 }
 const META=['name','title','image','alt','released','prec','tba','platforms','genres','steam'];
 const pickMeta=g=>{const o={};META.forEach(k=>{const v=g[k];if(v===undefined)return;if((k==='image'||k==='alt'||k==='title'||k==='steam')&&(!v||!v.length))return;o[k]=v});return o};
-function meta(id){const e=db.games[id];return Object.assign({id},e||{},known.get(id)||{},detailCache.get(id)||{})}
+function meta(id){const e=db.games[id];return catFix(Object.assign({id},e||{},known.get(id)||{},detailCache.get(id)||{}))}
 function subline(g){return[g.released?yr(g.released):(g.tba?'TBA':''),(g.genres||[])[0]].filter(Boolean).join(' · ')||(String(g.id).startsWith('s:')?'Steam':'')}
 
 function setStatus(g,st){
@@ -1649,7 +1700,7 @@ function paintChips(){
 }
 function paintDiscoverStatus(){
   const el=$('#d-stat');if(!el)return;
-  const bz=$('#d-busy');if(bz)bz.innerHTML=D.busy?`<i class="pulse"></i>${D.src==='live'?'Aktualisiere':'Lade aktuelle Daten'}`:'';
+  const bz=$('#d-busy');if(bz)bz.innerHTML=D.busy?`<i class="pulse"></i>${D.src==='catalog'?'Lade aktuelle Daten':''}`:'';
   let h='';
   if(!D.busy&&D.err&&D.src!=='live')h=`<div class="dstat err">${D.src==='cache'?'Zuletzt gespeicherte Daten. Live-Daten sind gerade nicht erreichbar.':'Eingebauter Katalog. Live-Daten sind gerade nicht erreichbar.'}<button data-act="dretry">Erneut versuchen</button></div>`;
   el.innerHTML=h;
@@ -1675,25 +1726,30 @@ let discT=0;
 function schedDisc(){schedSteamFill(2500);if(discT)return;discT=setTimeout(()=>{discT=0;paintDiscover()},90)}
 async function refreshLive(force){
   if(D.busy)return;
-  if(!force&&D.src==='live'&&Date.now()-D.liveAt<15*60*1000)return;
+  if(!force&&D.src==='live')return;           // nur einmal pro Öffnen
   D.busy=true;D.err=null;paintDiscoverStatus();
-  const got={soon:null,fresh:null,top:null};
-  const apply=()=>{
-    const all=[];
-    ['soon','fresh','top'].forEach(k=>{if(got[k]){D[k]=got[k];all.push(...got[k])}});
-    all.forEach(rem);D.src='live';D.loaded=Date.now();schedDisc();
-  };
+  const got={soon:null,fresh:null,top:null};let closed=false;
   try{
-    await liveDiscover2((key,items)=>{if(key!=='enrich')got[key]=items;apply()});
-    pset('disc3',{soon:D.soon,fresh:D.fresh,top:D.top});D.liveAt=Date.now();
+    await Promise.race([liveDiscover2((key,items)=>{if(!closed&&key!=='enrich')got[key]=items}),sleep(45000)]);
   }catch(e){D.err=e}
+  closed=true;
+  /* alles auf einmal übernehmen: kein Nachrücken, keine Sprünge */
+  if(got.soon||got.fresh||got.top){
+    const off=offDiscover();
+    if(got.soon)D.soon=mergeCatalog(got.soon,off.soon);
+    if(got.fresh)D.fresh=mergeCatalog(got.fresh,off.fresh);
+    if(got.top)D.top=got.top;
+    D.soon.concat(D.fresh,D.top).forEach(rem);
+    D.src='live';D.err=null;D.loaded=D.liveAt=Date.now();
+    pset('disc3',{soon:D.soon,fresh:D.fresh,top:D.top});
+  }
   D.busy=false;paintDiscover();
 }
 /* Sofort zeigen (Zwischenspeicher oder Katalog), dann live aktualisieren */
 function loadDiscover(force){
   if(!D.loaded){
     const c=pget('disc3');
-    if(c&&c.v&&((c.v.soon||[]).length||(c.v.fresh||[]).length)){D.soon=c.v.soon||[];D.fresh=c.v.fresh||[];D.top=c.v.top||[];D.src='cache'}
+    if(c&&c.v&&((c.v.soon||[]).length||(c.v.fresh||[]).length)){const off=offDiscover();D.soon=mergeCatalog(c.v.soon||[],off.soon);D.fresh=mergeCatalog(c.v.fresh||[],off.fresh);D.top=c.v.top||[];D.src='cache'}
     else{const r=offDiscover();D.soon=r.soon;D.fresh=r.fresh;D.top=r.top;D.src='catalog'}
     D.loaded=Date.now();
     D.soon.concat(D.fresh,D.top).forEach(rem);
@@ -2006,6 +2062,7 @@ async function refreshWishlistWd(){
         if(x.platforms.length)e.platforms=x.platforms;
         if(x.genres.length)e.genres=x.genres;
       }
+      catFix(e);
       e.checked=now;
     });
     saveDb();paintAll();
@@ -2231,6 +2288,7 @@ function importData(file){
 /* ---------- Start ---------- */
 loadAll();
 migrateIds();
+fixDbCat();
 pruneCache();
 buildTabbar();
 paintSearchFilters();
