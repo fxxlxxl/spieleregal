@@ -432,7 +432,7 @@ function loadAll(){
   try{const u=JSON.parse(lsGet(UIKEY)||'null');if(u&&typeof u==='object')UI=Object.assign(UI,u);UI.lq=''}catch(e){}
 }
 function saveDb(){if(!lsSet(KEY,JSON.stringify(db)))toast('Speichern nicht möglich. Der Browser-Speicher ist voll oder gesperrt.')}
-function saveUI(){lsSet(UIKEY,JSON.stringify({filter:UI.filter,sort:UI.sort,view:UI.view}))}
+function saveUI(){lsSet(UIKEY,JSON.stringify({filter:UI.filter,sort:UI.sort,view:UI.view,tab:UI.tab,sy:UI.sy,at:UI.at,layer:UI.layer,lsy:UI.lsy}))}
 
 /* ---------- Datenquellen: Wikidata und Wikipedia, ohne Schlüssel ---------- */
 const WD='https://query.wikidata.org/sparql';
@@ -598,9 +598,29 @@ const commonsImg=u=>/^https?:\/\/commons\.wikimedia\.org\/wiki\/Special:FilePath
 const extraImgs=b=>STEAM(bv(b,'steam')).concat([commonsImg(bv(b,'img'))]).filter(Boolean);
 function applyImgs(g,wiki,ex){const l=[...new Set([wiki].concat(ex||[]).filter(Boolean))];g.image=l[0]||'';g.alt=l.slice(1);delete g.ex;return g}
 const imgList=g=>[...new Set([g.image].concat(g.alt||[]).filter(Boolean))];
+const kh=t=>{let h=0;for(let i=0;i<t.length;i++)h=(h*31+t.charCodeAt(i))|0;return(h>>>0).toString(36)};
 function imgTag(g,cls,alt,more){
   const l=imgList(g);if(!l.length)return'';
-  return'<img'+(cls?' class="'+cls+'"':'')+' src="'+esc(l[0])+'"'+(l.length>1?' data-alt="'+esc(l.slice(1).join(' '))+'"':'')+' alt="'+esc(alt||'')+'"'+(more||'')+'>';
+  return'<img'+(cls?' class="'+cls+'"':'')+' src="'+esc(l[0])+'"'+(l.length>1?' data-alt="'+esc(l.slice(1).join(' '))+'"':'')+' data-k="'+kh(l.join(' '))+'" alt="'+esc(alt||'')+'"'+(more||'')+'>';
+}
+/* Seiteninhalt abgleichen statt komplett ersetzen: unveränderte Teile samt Bildern bleiben stehen (kein Flackern, Scrollstände bleiben) */
+function setHTML(el,html){
+  const t=document.createElement('template');t.innerHTML=html;
+  morphKids(el,t.content);
+}
+function morphKids(a,b){
+  const xs=Array.from(a.childNodes),ys=Array.from(b.childNodes),n=Math.max(xs.length,ys.length);
+  for(let i=0;i<n;i++){
+    const x=xs[i],y=ys[i];
+    if(!y){a.removeChild(x);continue}
+    if(!x){a.appendChild(y);continue}
+    if(x.nodeType!==y.nodeType||x.nodeName!==y.nodeName){a.replaceChild(y,x);continue}
+    if(x.nodeType!==1){if(x.nodeValue!==y.nodeValue)x.nodeValue=y.nodeValue;continue}
+    if(x.nodeName==='IMG'){if(x.getAttribute('data-k')!==y.getAttribute('data-k')||(x.getAttribute('data-k')==null&&x.getAttribute('src')!==y.getAttribute('src')))a.replaceChild(y,x);continue}
+    Array.from(x.attributes).forEach(at=>{if(!y.hasAttribute(at.name))x.removeAttribute(at.name)});
+    Array.from(y.attributes).forEach(at=>{if(x.getAttribute(at.name)!==at.value)x.setAttribute(at.name,at.value)});
+    morphKids(x,y);
+  }
 }
 function rowGame(b){
   const id=qidOf(bv(b,'item'));if(!isQ(id))return null;
@@ -811,21 +831,151 @@ async function csDetail(app,signal){
   return{name:x.title,released:unixIso(x.releaseDate),prec:11,tba:false,platforms:['Microsoft Windows']};
 }
 const stGame=x=>applyImgs({id:'s:'+x.appid,name:x.name,released:x.released||'',prec:11,tba:false,platforms:x.platforms||['Microsoft Windows'],genres:[],steam:x.appid},'',STEAMIMG(x.appid));
+/* --- Steam-Namensindex ---
+   Liste aller Steam-Spiele (App-ID und Name) aus einem öffentlichen, täglich aktualisierten GitHub-Verzeichnis.
+   jsDelivr und GitHub liefern sie mit CORS-Freigabe. Damit findet die App jedes Steam-Spiel, auch ohne Wikipedia-Artikel,
+   und bekommt über die App-ID das Cover vom Steam-Server. Die Liste wird einmal geladen und im Browser gemerkt. */
+const SIDX_URLS=['https://cdn.jsdelivr.net/gh/jsnli/SteamAppIDList@master/data/games_appid.json','https://raw.githubusercontent.com/jsnli/SteamAppIDList/master/data/games_appid.json'];
+const SIDX_KEY='sidx1',SIDX_TTL=5*864e5;
+const SIDX={ready:false,p:null,ids:null,names:null,low:null,map:null,fail:0};
+const idbOpen=()=>new Promise((res,rej)=>{try{const r=indexedDB.open('spielregal',1);r.onupgradeneeded=()=>r.result.createObjectStore('kv');r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error)}catch(e){rej(e)}});
+async function idbGet(k){try{const d=await idbOpen();return await new Promise(res=>{const q=d.transaction('kv').objectStore('kv').get(k);q.onsuccess=()=>res(q.result||null);q.onerror=()=>res(null)})}catch(e){return null}}
+async function idbSet(k,v){try{const d=await idbOpen();await new Promise(res=>{const t=d.transaction('kv','readwrite');t.objectStore('kv').put(v,k);t.oncomplete=t.onerror=t.onabort=()=>res()})}catch(e){}}
+function sidxParse(j){
+  let a=j;
+  if(a&&!Array.isArray(a)){
+    if(Array.isArray(a.apps))a=a.apps;
+    else if(a.applist&&Array.isArray(a.applist.apps))a=a.applist.apps;
+    else if(a.response&&Array.isArray(a.response.apps))a=a.response.apps;
+    else a=Object.keys(a).map(k=>({appid:k,name:j[k]}));
+  }
+  const ids=[],names=[];
+  if(!Array.isArray(a))return{ids,names};
+  for(const x of a){
+    let id,nm;
+    if(Array.isArray(x)){id=x[0];nm=x[1]}
+    else if(x&&typeof x==='object'){id=x.appid!=null?x.appid:(x.app_id!=null?x.app_id:x.id);nm=x.name!=null?x.name:x.title}
+    id=Number(id);
+    if(!(id>0)||typeof nm!=='string')continue;
+    nm=nm.trim();
+    if(nm.length<2||ST_JUNK.test(nm))continue;
+    ids.push(id);names.push(nm);
+  }
+  return{ids,names};
+}
+async function sidxFill(rec){
+  SIDX.ids=rec.ids;SIDX.names=rec.names;SIDX.map=null;
+  const low=new Array(rec.names.length);
+  for(let i=0;i<low.length;i++){low[i]=fold(rec.names[i]);if(i%20000===19999)await sleep(0)}
+  SIDX.low=low;SIDX.ready=true;
+}
+function steamIndex(){
+  if(SIDX.ready)return Promise.resolve(SIDX);
+  if(SIDX.p)return SIDX.p;
+  if(Date.now()-SIDX.fail<10*6e4)return Promise.resolve(null);
+  SIDX.p=(async()=>{
+    const c=await idbGet(SIDX_KEY);
+    const good=c&&c.ids&&c.names&&c.ids.length>1000;
+    if(good&&Date.now()-c.at<SIDX_TTL){await sidxFill(c);return SIDX}
+    for(const u of SIDX_URLS){
+      try{
+        const ctl=new AbortController(),t=setTimeout(()=>ctl.abort(),60000);
+        const r=await fetch(u,{signal:ctl.signal});clearTimeout(t);
+        if(!r.ok)continue;
+        const p=sidxParse(await r.json());
+        if(p.ids.length<1000)continue;
+        const rec={at:Date.now(),ids:p.ids,names:p.names};
+        idbSet(SIDX_KEY,rec);await sidxFill(rec);return SIDX;
+      }catch(e){}
+    }
+    if(good){await sidxFill(c);return SIDX}
+    SIDX.fail=Date.now();SIDX.p=null;return null;
+  })();
+  return SIDX.p;
+}
+function sidxFind(q,max){
+  if(!SIDX.ready)return[];
+  const qn=fold(q).trim().replace(/\s+/g,' ');if(qn.length<2)return[];
+  const toks=qn.split(' '),low=SIDX.low,hits=[];
+  for(let i=0;i<low.length;i++){
+    const n=low[i];
+    let ok=true;for(const t of toks)if(!n.includes(t)){ok=false;break}
+    if(!ok)continue;
+    hits.push([n===qn?0:n.startsWith(qn)?1:(' '+n).includes(' '+qn)?2:3,n.length,i]);
+  }
+  hits.sort((a,b)=>a[0]-b[0]||a[1]-b[1]||SIDX.ids[b[2]]-SIDX.ids[a[2]]);
+  return hits.slice(0,max).map(h=>({appid:String(SIDX.ids[h[2]]),name:SIDX.names[h[2]],platforms:['Microsoft Windows']}));
+}
+const nk=t=>fold(t).replace(/[^a-z0-9]+/g,'');
+function sidxExact(k){
+  if(!SIDX.ready)return'';
+  if(!SIDX.map){SIDX.map=new Map();SIDX.names.forEach((n,i)=>{const kk=nk(n);if(!kk)return;const a=SIDX.map.get(kk);if(a)a.push(i);else SIDX.map.set(kk,[i])})}
+  const a=SIDX.map.get(k);
+  return a&&a.length===1?String(SIDX.ids[a[0]]):'';
+}
 async function steamSearch(q,signal){
   const k='st|'+fold(q).trim();
   const c=cacheGet(k,10*6e4,false);if(c)return c;
-  let it,ok=true;
-  try{
-    const j=await steamFetch(STORE+'api/storesearch/?'+qs({term:q,l:'german',cc:'DE'}),signal,j=>!!j&&Array.isArray(j.items));
-    it=j.items.filter(x=>x&&x.type==='app'&&stId(x.id)&&x.name&&!ST_JUNK.test(x.name)).map(x=>({appid:String(x.id),name:x.name,platforms:stPlats(x.platforms)}));
-  }catch(e){
-    if(e&&e.name==='AbortError')throw e;
-    try{it=await csSearch(q,signal)}
-    catch(e2){if(e2&&e2.name==='AbortError')throw e2;it=[];ok=false}
+  let it=[],ok=true;
+  const ix=await Promise.race([steamIndex().catch(()=>null),sleep(4000).then(()=>null)]);
+  if(signal&&signal.aborted)throw new DOMException('Aborted','AbortError');
+  if(ix)it=sidxFind(q,12);
+  if(!it.length){
+    try{
+      const j=await steamFetch(STORE+'api/storesearch/?'+qs({term:q,l:'german',cc:'DE'}),signal,j=>!!j&&Array.isArray(j.items));
+      it=j.items.filter(x=>x&&x.type==='app'&&stId(x.id)&&x.name&&!ST_JUNK.test(x.name)).map(x=>({appid:String(x.id),name:x.name,platforms:stPlats(x.platforms)}));
+    }catch(e){
+      if(e&&e.name==='AbortError')throw e;
+      try{it=await csSearch(q,signal)}
+      catch(e2){if(e2&&e2.name==='AbortError')throw e2;it=[];ok=false}
+    }
   }
   const out=it.slice(0,12).map(stGame);
   if(ok)cacheSet(k,out,false);
   return out;
+}
+/* Spiele ohne Cover: Steam-App-ID über den genauen Namen finden (nur PC-Spiele, nur eindeutige Namen) */
+const STNK='sr.stn1';let STN={};try{STN=JSON.parse(lsGet(STNK)||'{}')||{}}catch(e){STN={}}
+const stnSave=()=>{const ks=Object.keys(STN);if(ks.length>500)ks.sort((a,b)=>STN[a][1]-STN[b][1]).slice(0,ks.length-400).forEach(k=>delete STN[k]);lsSet(STNK,JSON.stringify(STN))};
+const isPcGame=g=>{const p=g.platforms||[];return!p.length||p.some(x=>/windows|linux|macos|^pc$/i.test(x))};
+let sfT=0,sfBusy=false;
+function schedSteamFill(delay){if(sfT||sfBusy)return;sfT=setTimeout(()=>{sfT=0;steamFillAll()},delay||1800)}
+async function steamFillAll(){
+  if(sfBusy)return;
+  if(covBusy||covQ.length){schedSteamFill(1500);return}
+  sfBusy=true;
+  try{
+    const all=[].concat(D.soon,D.fresh,D.top,S.games,U.games,Object.values(db.games));
+    const seen=new Set(),need=[],now=Date.now();
+    all.forEach(g=>{
+      if(!g||!g.name||seen.has(g.id))return;seen.add(g.id);
+      if(imgList(g).length||!isPcGame(g))return;
+      if(String(g.id).startsWith('o:')&&!COV[g.oid||g.id])return;
+      need.push(g);
+    });
+    let changed=false,dbChanged=false;
+    const apply=(g,app)=>{
+      applyImgs(g,'',STEAMIMG(app));g.steam=g.steam||app;g.sf=1;rem(g);changed=true;
+      if(db.games[g.id]===g)dbChanged=true;
+    };
+    const todo=[];
+    need.forEach(g=>{
+      const k=nk(g.name);if(!k)return;
+      const e=STN[k];
+      if(e&&e[0])apply(g,e[0]);
+      else if(!(e&&now-e[1]<7*864e5))todo.push([g,k]);
+    });
+    if(todo.length){
+      const ix=await steamIndex().catch(()=>null);
+      if(ix){
+        todo.forEach(([g,k])=>{const hit=sidxExact(k);STN[k]=[hit||0,now];if(hit)apply(g,hit)});
+        stnSave();
+      }
+    }
+    if(dbChanged)saveDb();
+    if(changed)schedPaint();
+  }catch(e){}
+  finally{sfBusy=false}
 }
 async function steamAppDetails(app,signal){
   const j=await steamFetch(STORE+'api/appdetails?'+qs({appids:app,l:'german',cc:'DE'}),signal,j=>!!j&&typeof j==='object'&&!Array.isArray(j)&&j[app]!=null);
@@ -860,15 +1010,16 @@ async function steamDetail(id){
 }
 /* Treffer von Steam in die Wikidata-Treffer einreihen. Doppelte (gleiche Steam-ID oder gleicher Name) entfallen */
 const nkey=t=>fold(String(t||'').replace(/\s*[-–:]?\s*(game of the year|goty|definitive|complete|deluxe|ultimate|enhanced|anniversary|director'?s cut|gold|premium|legendary|standard|special|collector'?s)\s+edition.*$/i,'')).replace(/[^a-z0-9]+/g,'');
-function mergeSteam(games,sg,q){
+function mergeSteam(games,sg,q,keep){
   if(!sg||!sg.length)return games;
   const ids=new Set(games.map(g=>g.steam).filter(Boolean)),names=new Set(games.map(g=>nkey(g.name)).filter(Boolean));
   const add=sg.filter(x=>!ids.has(x.steam)&&!(nkey(x.name)&&names.has(nkey(x.name)))&&!games.some(g=>g.id===x.id));
   if(!add.length)return games;
   const qn=nkey(q),sc=g=>{const n=nkey(g.name);return!qn?3:n===qn?0:n.startsWith(qn)?1:n.includes(qn)?2:3};
+  if(keep){const ex=add.filter(g=>sc(g)===0&&!games.some(x=>sc(x)===0));return ex.concat(games,add.filter(g=>!ex.includes(g)))}
   return games.concat(add).map((g,i)=>[g,i]).sort((a,b)=>sc(a[0])-sc(b[0])||a[1]-b[1]).map(x=>x[0]);
 }
-async function liveSearch(q,page,f,signal){
+async function liveSearch0(q,page,f,signal){
   const wantSteam=page===1&&(f==='all'||f==='pc')&&q.trim().length>=2;
   const sp=wantSteam?steamSearch(q,signal):null;
   const box={done:false,v:[]};
@@ -888,6 +1039,24 @@ async function liveSearch(q,page,f,signal){
   return{games,next,late:sp.then(sg=>{sg.forEach(rem);return sg},()=>[])};
 }
 
+/* Der eingebaute Katalog ergänzt die Live-Suche: so findet man bekannte Neuerscheinungen auch, wenn Wikipedia oder Steam gerade nichts liefern. */
+function catExtra(q,f,have){
+  const names=new Set(have.map(g=>nkey(g.name)).filter(Boolean)),ids=new Set(have.map(g=>g.steam).filter(Boolean));
+  return offSearch(q,f,1).games.filter(g=>!names.has(nkey(g.name))&&!(g.steam&&ids.has(g.steam))&&!have.some(x=>x.id===g.id)).slice(0,4);
+}
+async function liveSearch(q,page,f,signal){
+  const use=page===1&&f!=='soon'&&q.trim().length>=2;
+  let r;
+  try{r=await liveSearch0(q,page,f,signal)}
+  catch(e){
+    if(!use||(e&&e.name==='AbortError'))throw e;
+    const ex=catExtra(q,f,[]);if(!ex.length)throw e;
+    return{games:ex,next:false};
+  }
+  if(use){const ex=catExtra(q,f,r.games);if(ex.length)r.games=r.games.concat(ex)}
+  return r;
+}
+
 /* --- Eingebauter Katalog (Rückfall, wenn keine Live-Daten erreichbar sind) --- */
 const PLAT={PC:'PC',PS5:'PlayStation 5',PS4:'PlayStation 4',XSX:'Xbox Series X/S',XB1:'Xbox One',NSW:'Nintendo Switch',NS2:'Nintendo Switch 2'};
 const CAT=[
@@ -896,16 +1065,16 @@ const CAT=[
 "Dragon Quest Monsters: The Withered World|2026-12-03|Rollenspiel|PC,PS5,XSX,NSW,NS2|Square Enix",
 "Xenoblade Chronicles 3 (Switch 2 Edition)|2026-12-03|Rollenspiel|NS2|Monolith Soft",
 "Rayman Legends Retold|2026-12-03|Jump 'n' Run|PC,PS5,XSX,NS2|Ubisoft",
-"Warhammer 40,000: Dawn of War IV|2026-12-03|Echtzeit-Strategie|PC|",
-"Thief: The Dark Project Remastered|2026-12-03|Stealth|PC,PS5,XSX,NS2|",
+"Warhammer 40,000: Dawn of War IV|2026-12-03|Echtzeit-Strategie|PC||2272360",
+"Thief: The Dark Project Remastered|2026-12-03|Stealth|PC,PS5,XSX,NS2||4200960",
 "Professor Layton and the New World of Steam|2026-12-10|Rätsel-Adventure|PC,PS5,NSW,NS2|Level-5",
 "Attack on Titan 3|2026-12-10|Action|PC,PS5,XSX,NS2|",
 "Path of Exile 2 (Version 1.0)|2026-12-11|Action-Rollenspiel|PC,PS5,XSX|Grinding Gear Games",
-"Danganronpa 2x2|2027-01-14|Adventure|PC,PS5,NSW,NS2|Spike Chunsoft",
-"Stranger Than Heaven|2027-01-15|Action-Adventure|PC,PS5,XSX|RGG Studio",
-"Witchbrook|2027-01-28|Lebenssimulation, Rollenspiel|PC,PS5,XSX,NSW,NS2|Chucklefish",
-"Warhammer 40,000: Dark Heresy|2027-01-28|Rollenspiel|PC,PS5,XSX|Owlcat Games",
-"Metro 2039|2027-02-04|Ego-Shooter|PC,PS5,XSX|4A Games",
+"Danganronpa 2x2|2027-01-14|Adventure|PC,PS5,NSW,NS2|Spike Chunsoft|3751230",
+"Stranger Than Heaven|2027-01-15|Action-Adventure|PC,PS5,XSX|RGG Studio|4260840",
+"Witchbrook|2027-01-28|Lebenssimulation, Rollenspiel|PC,PS5,XSX,NSW,NS2|Chucklefish|1846700",
+"Warhammer 40,000: Dark Heresy|2027-01-28|Rollenspiel|PC,PS5,XSX|Owlcat Games|3710600",
+"Metro 2039|2027-02-04|Ego-Shooter|PC,PS5,XSX|4A Games|2590240",
 "Tomb Raider: Legacy of Atlantis|2027-02-12|Action-Adventure|PC,PS5,XSX,NS2|Crystal Dynamics",
 "Persona 4 Revival|2027-02-18|Rollenspiel|PC,PS5,XSX|Atlus",
 "Fable|2027-02-23|Rollenspiel|PC,PS5,XSX|Playground Games",
@@ -914,7 +1083,7 @@ const CAT=[
 "Phantom Blade Zero|2026-10-29|Action-Rollenspiel|PC,PS5|S-GAME",
 "Call of Duty: Modern Warfare 4|2026-10-23|Ego-Shooter|PC,PS5,XSX,NS2|Infinity Ward",
 "Planet Zoo 2|2026-10-13|Simulation|PC,PS5,XSX|Frontier Developments",
-"Star Wars: Galactic Racer|2026-10-06|Rennspiel|PC,PS5,XSX|",
+"Star Wars: Galactic Racer|2026-10-06|Rennspiel|PC,PS5,XSX||4078430",
 "Ace Combat 8: Wings of Theve|2026-10-02|Flugaction|PS5|Bandai Namco",
 "Onimusha: Way of the Sword|2026-09-25|Action-Adventure|PC,PS5,XSX|Capcom",
 "Silent Hill: Townfall|2026-09-24|Survival-Horror|PC,PS5|",
@@ -931,7 +1100,7 @@ const CAT=[
 "Nioh 3|2026-02-06|Action-Rollenspiel|PC,PS5|Team Ninja",
 "Pokémon Pokopia|2026-03-05|Lebenssimulation|NS2|Omega Force",
 "Marathon|2026-03-05|Extraction-Shooter|PC,PS5,XSX|Bungie",
-"Slay the Spire 2|2026-03-05|Roguelike, Deckbuilder|PC|Mega Crit",
+"Slay the Spire 2|2026-03-05|Roguelike, Deckbuilder|PC|Mega Crit|2868840",
 "Monster Hunter Stories 3: Twisted Reflection|2026-03-13|Rollenspiel|PC,PS5,XSX|Capcom",
 "Tomodachi Life: Living the Dream|2026-04-16|Lebenssimulation|NSW|Nintendo",
 "Mario Tennis Fever|2026-02-12|Sport|NS2|Camelot",
@@ -1051,11 +1220,12 @@ const slugOf=s=>String(s).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f
 function offAll(){
   if(OFFC)return OFFC;
   OFFC=CAT.map(line=>{
-    const [name,date,gen,pl,dev]=line.split('|');
+    const [name,date,gen,pl,dev,sid]=line.split('|');
     const prec=date.length===4?9:date.length===7?10:11;
     const released=prec===9?date+'-01-01':prec===10?date+'-01':date;
     const oid='o:'+slugOf(name),cv=COV[oid]||{};
-    return{id:cv.q||oid,oid,name,title:cv.t||'',image:cv.i||'',released,prec,tba:false,platforms:pl.split(',').map(c=>PLAT[c]||c),genres:gen.split(',').map(s=>s.trim()),developers:dev?[dev]:[]};
+    const il=[cv.i].concat(STEAMIMG(sid)).filter(Boolean);
+    return Object.assign({id:cv.q||oid,oid,name,title:cv.t||'',image:il[0]||'',alt:il.slice(1),steam:sid||'',released,prec,tba:false,platforms:pl.split(',').map(c=>PLAT[c]||c),genres:gen.split(',').map(s=>s.trim()),developers:dev?[dev]:[]},sid&&!cv.i?{sf:1}:{});
   });
   OFFC.forEach(rem);
   return OFFC;
@@ -1165,7 +1335,7 @@ function adoptQid(g,q){
 }
 function applyCov(g,c){
   if(!c||c.m)return;
-  if(c.i&&!g.image){const l=[c.i].concat(g.alt||[]);g.image=l[0];g.alt=l.slice(1)}
+  if(c.i&&(!g.image||g.sf)){const l=[...new Set([c.i].concat(g.sf?imgList(g):(g.alt||[])))];g.image=l[0];g.alt=l.slice(1);delete g.sf}
   if(c.t&&!g.title)g.title=c.t;
   if(c.q)adoptQid(g,c.q);
 }
@@ -1201,7 +1371,7 @@ async function runCov(){
   covBusy=false;
 }
 let paintT=0;
-function schedPaint(){if(paintT)return;paintT=setTimeout(()=>{paintT=0;paintLists()},140)}
+function schedPaint(){schedSteamFill();if(paintT)return;paintT=setTimeout(()=>{paintT=0;paintLists()},140)}
 function paintLists(){
   paintDiscover();
   if(tab==='library')paintLibrary();
@@ -1349,7 +1519,7 @@ function gcard(g){
 }
 const credit=()=>MODE==='offline'
   ?`<p class="credit">Eingebauter Katalog mit ${offAll().length} Spielen · Stand November 2026</p>`
-  :`<p class="credit">Daten von <a href="https://www.wikidata.org" target="_blank" rel="noopener">Wikidata</a> (CC0) · Texte und Cover von <a href="https://www.wikipedia.org" target="_blank" rel="noopener">Wikipedia</a> und <a href="https://store.steampowered.com" target="_blank" rel="noopener">Steam</a>, Rechte bei den jeweiligen Inhabern. Steam-Abfragen laufen, wenn Steam sie nicht direkt erlaubt, über einen öffentlichen Weiterleitungsdienst (allorigins.win) oder <a href="https://www.cheapshark.com" target="_blank" rel="noopener">CheapShark</a>.</p>`;
+  :`<p class="credit">Daten von <a href="https://www.wikidata.org" target="_blank" rel="noopener">Wikidata</a> (CC0) · Texte und Cover von <a href="https://www.wikipedia.org" target="_blank" rel="noopener">Wikipedia</a> und <a href="https://store.steampowered.com" target="_blank" rel="noopener">Steam</a>, Rechte bei den jeweiligen Inhabern. Steam-Titel kommen aus einer öffentlichen, täglich aktualisierten Liste auf GitHub. Weitere Steam-Daten holt die App direkt bei Steam oder, wenn Steam das nicht erlaubt, über einen öffentlichen Weiterleitungsdienst (allorigins.win) oder <a href="https://www.cheapshark.com" target="_blank" rel="noopener">CheapShark</a>.</p>`;
 const banner=()=>MODE==='offline'
   ?`<div class="note" style="margin:0 0 18px"><b style="color:var(--text)">Eingebauter Katalog</b><br>Live-Daten sind gerade nicht erreichbar. Du siehst eine Auswahl von ${offAll().length} Spielen, Cover kommen nach, sobald Wikipedia erreichbar ist. Deine Bibliothek funktioniert wie gewohnt.<br><button class="btn small" data-act="retrylive">Live erneut versuchen</button></div>`:'';
 const skelRail=()=>`<div class="rail">${'<div class="skel c"></div>'.repeat(4)}</div>`;
@@ -1497,12 +1667,12 @@ function paintDiscover(){
   D.dirty=false;
   paintChips();paintDiscoverStatus();
   const sl=$$('.rail',body).map(r=>r.scrollLeft);const hs=$('#heroes',body);const hx=hs?hs.scrollLeft:0;
-  body.innerHTML=discHTML()+credit();
+  setHTML(body,discHTML()+credit());
   $$('.rail',body).forEach((r,i)=>{if(sl[i])r.scrollLeft=sl[i]});
   const h2=$('#heroes',body);if(h2){if(hx)h2.scrollLeft=hx;heroDots(h2)}
 }
 let discT=0;
-function schedDisc(){if(discT)return;discT=setTimeout(()=>{discT=0;paintDiscover()},90)}
+function schedDisc(){schedSteamFill(2500);if(discT)return;discT=setTimeout(()=>{discT=0;paintDiscover()},90)}
 async function refreshLive(force){
   if(D.busy)return;
   if(!force&&D.src==='live'&&Date.now()-D.liveAt<15*60*1000)return;
@@ -1549,7 +1719,7 @@ function paintSearch(){
   const el=$('#sres');
   if(!S.q.trim()&&S.f!=='soon'){
     const r=recent();
-    el.innerHTML=banner()+(r.length?`<div class="sec"><div class="sec-h"><h2>Zuletzt gesucht</h2><button data-act="rclear">Leeren</button></div><div class="chips" style="flex-wrap:wrap;margin:0;padding:0;overflow:visible">${r.map(x=>`<button class="chip" data-act="rsearch" data-q="${esc(x)}">${esc(x)}</button>`).join('')}</div></div>`:`<div class="empty"><h3>Finde dein nächstes Spiel</h3><p>Suche nach Titeln aus der gesamten Datenbank, auch nach Spielen, die noch nicht erschienen sind.</p></div>`)+credit();
+    setHTML(el,banner()+(r.length?`<div class="sec"><div class="sec-h"><h2>Zuletzt gesucht</h2><button data-act="rclear">Leeren</button></div><div class="chips" style="flex-wrap:wrap;margin:0;padding:0;overflow:visible">${r.map(x=>`<button class="chip" data-act="rsearch" data-q="${esc(x)}">${esc(x)}</button>`).join('')}</div></div>`:`<div class="empty"><h3>Finde dein nächstes Spiel</h3><p>Suche nach Titeln aus der gesamten Datenbank, auch nach Spielen, die noch nicht erschienen sind.</p></div>`)+credit());
     return;
   }
   const more=`<div style="text-align:center;margin-top:14px"><button class="btn" data-act="smore" ${S.loading?'disabled':''}>${S.loading?'Lädt …':'Mehr laden'}</button></div>`;
@@ -1562,7 +1732,7 @@ function paintSearch(){
     if(S.late)h+=`<div class="dstat" style="justify-content:center;margin:14px 0 0"><i class="pulse"></i>Suche auch auf Steam …</div>`;
     if(S.next)h+=more;
   }
-  el.innerHTML=banner()+h+credit();
+  setHTML(el,banner()+h+credit());
 }
 let sT=null;
 function scheduleSearch(){clearTimeout(sT);sT=setTimeout(()=>runSearch(true),350)}
@@ -1579,12 +1749,12 @@ async function runSearch(reset){
     if(ctl!==S.ctl)return;
     S.games=reset?r.games:S.games.concat(r.games.filter(g=>!S.games.some(x=>x.id===g.id)));
     S.next=r.next;S.done=true;S.loading=false;S.late=!!r.late;
-    ensureCovers(S.games);
+    ensureCovers(S.games);schedSteamFill();
     if(q.length>=3)addRecent(q);
     if(r.late)r.late.then(sg=>{
       if(ctl!==S.ctl)return;
       S.late=false;
-      if(sg.length){S.games=mergeSteam(S.games,sg,q);ensureCovers(S.games)}
+      if(sg.length){S.games=mergeSteam(S.games,sg,q,true);ensureCovers(S.games)}
       paintSearch();
     });
   }catch(e){
@@ -1605,8 +1775,8 @@ function paintUpcoming(){
   const l=layers.find(x=>x.key==='upcoming');if(!l)return;
   $('#ufilters',l.el).innerHTML=Object.entries(SF).filter(([k])=>k!=='soon').map(([k,v])=>`<button class="chip" data-act="ufilter" data-f="${k}" aria-pressed="${U.f===k}">${esc(v.l)}</button>`).join('');
   const el=$('#ures',l.el);
-  if(U.err&&!U.games.length){el.innerHTML=noteErr(U.err,'uretry');return}
-  if(U.done&&!U.games.length){el.innerHTML=banner()+`<div class="empty"><h3>Nichts gefunden</h3><p>Für diese Plattform stehen aktuell keine Spiele im Kalender.</p></div>`;return}
+  if(U.err&&!U.games.length){setHTML(el,noteErr(U.err,'uretry'));return}
+  if(U.done&&!U.games.length){setHTML(el,banner()+`<div class="empty"><h3>Nichts gefunden</h3><p>Für diese Plattform stehen aktuell keine Spiele im Kalender.</p></div>`);return}
   const sorted=U.games.slice().sort(byDate);
   let h=banner()+(U.loading&&U.src!=='live'?`<div class="dstat"><i class="pulse"></i>Aktualisiere …</div>`:''),cur='';
   sorted.forEach(g=>{
@@ -1617,7 +1787,7 @@ function paintUpcoming(){
   if(cur)h+='</div>';
   if(U.err)h+=noteErr(U.err,'uretry');
   if(U.next)h+=`<div style="text-align:center;margin-top:16px"><button class="btn" data-act="umore" ${U.loading?'disabled':''}>${U.loading?'Lädt …':'Mehr laden'}</button></div>`;
-  el.innerHTML=h+credit();
+  setHTML(el,h+credit());
 }
 async function loadUpcoming(reset){
   if(reset){
@@ -1673,10 +1843,10 @@ function paintLibrary(){
   $('#lfilters').innerHTML=chips.map(([k,l,n])=>`<button class="chip" data-act="lfilter" data-f="${k}" aria-pressed="${UI.filter===k}">${k==='liked'?IC.heart(true):''}${esc(l)} <b>${n}</b></button>`).join('');
   const el=$('#lres');
   if(!total){
-    el.innerHTML=`<div class="empty"><h3>Dein Regal ist leer</h3><p>Suche ein Spiel und füge es als Spiele ich, Durchgespielt, Backlog oder Wunschliste hinzu.</p><a class="btn primary" href="#search" data-act="gosearch">${IC.search}Spiele suchen</a></div>`+credit();return;
+    setHTML(el,`<div class="empty"><h3>Dein Regal ist leer</h3><p>Suche ein Spiel und füge es als Spiele ich, Durchgespielt, Backlog oder Wunschliste hinzu.</p><a class="btn primary" href="#search" data-act="gosearch">${IC.search}Spiele suchen</a></div>`+credit());return;
   }
-  if(!list.length){el.innerHTML=`<div class="empty"><h3>Nichts hier</h3><p>In dieser Ansicht ist noch kein Spiel.</p></div>`+credit();return}
-  el.innerHTML=(UI.view==='grid'?`<div class="grid">${list.map(gcard).join('')}</div>`:`<div class="list">${list.map(g=>row(g,true)).join('')}</div>`)+credit();
+  if(!list.length){setHTML(el,`<div class="empty"><h3>Nichts hier</h3><p>In dieser Ansicht ist noch kein Spiel.</p></div>`+credit());return}
+  setHTML(el,(UI.view==='grid'?`<div class="grid">${list.map(gcard).join('')}</div>`:`<div class="list">${list.map(g=>row(g,true)).join('')}</div>`)+credit());
 }
 
 /* ---------- Profil ---------- */
@@ -1980,8 +2150,8 @@ document.addEventListener('input',e=>{
 });
 function paintLibraryList(){
   const{list}=libList();const el=$('#lres');
-  if(!list.length){el.innerHTML=`<div class="empty"><h3>Nichts gefunden</h3><p>Zu deiner Eingabe passt kein Spiel in deiner Bibliothek.</p></div>`+credit();return}
-  el.innerHTML=(UI.view==='grid'?`<div class="grid">${list.map(gcard).join('')}</div>`:`<div class="list">${list.map(g=>row(g,true)).join('')}</div>`)+credit();
+  if(!list.length){setHTML(el,`<div class="empty"><h3>Nichts gefunden</h3><p>Zu deiner Eingabe passt kein Spiel in deiner Bibliothek.</p></div>`+credit());return}
+  setHTML(el,(UI.view==='grid'?`<div class="grid">${list.map(gcard).join('')}</div>`:`<div class="list">${list.map(g=>row(g,true)).join('')}</div>`)+credit());
 }
 $('#sform').addEventListener('submit',e=>{e.preventDefault();clearTimeout(sT);S.q=$('#q').value;$('#q').blur();runSearch(true)});
 
@@ -2069,8 +2239,10 @@ paintSearch();
 paintLibrary();
 paintProfile();
 const startHash=(location.hash||'').replace(/^#/,'');
+const cold=!location.hash||TABS.includes(startHash);
+const recentUse=!!UI.at&&Date.now()-UI.at<6*36e5;
 if(TABS.includes(startHash))tab=startHash;
-else tab=Object.keys(db.games).length?'library':'discover';
+else tab=(recentUse&&TABS.includes(UI.tab))?UI.tab:(Object.keys(db.games).length?'library':'discover');
 setTab(tab);
 if(!location.hash||TABS.includes(startHash))history.replaceState(null,'','#'+tab);
 window.addEventListener('hashchange',route);
@@ -2079,7 +2251,34 @@ firstRoute=false;
 loadDiscover();
 refreshWishlist();
 fillCovers();
+/* Ansicht merken: Tab, Scrollstand und geöffnetes Spiel. Beendet iOS die App im Hintergrund, geht es danach an derselben Stelle weiter. */
+let saveSyT=0;
+function saveView(){
+  try{
+    const sy=Object.assign({},UI.sy);
+    TABS.forEach(t=>{const el=$('#v-'+t);if(el&&!el.hidden)sy[t]=el.scrollTop});
+    const top=layers[layers.length-1],ls=top?$('.lyr-s',top.el):null;
+    UI.sy=sy;UI.tab=tab;UI.at=Date.now();UI.layer=top?top.key:'';UI.lsy=ls?ls.scrollTop:0;
+    saveUI();
+  }catch(e){}
+}
+const schedSave=()=>{clearTimeout(saveSyT);saveSyT=setTimeout(saveView,600)};
+document.addEventListener('scroll',schedSave,true);
+window.addEventListener('pagehide',saveView);
+function restoreView(){
+  if(!cold||!recentUse)return;
+  const el=$('#v-'+tab),y=(UI.sy||{})[tab];
+  const go=()=>{if(el&&y&&el.scrollTop<8)el.scrollTop=y};
+  go();requestAnimationFrame(go);setTimeout(go,500);setTimeout(go,1500);
+  if(UI.layer&&Date.now()-UI.at<30*6e4&&/^(game-.+|upcoming)$/.test(UI.layer)){
+    const ly=UI.lsy||0;
+    firstRoute=true;location.hash='#'+UI.layer;setTimeout(()=>{firstRoute=false},1000);
+    setTimeout(()=>{const t=layers[layers.length-1],s=t&&$('.lyr-s',t.el);if(s&&ly)s.scrollTop=ly},900);
+  }
+}
+restoreView();
 document.addEventListener('visibilitychange',()=>{
+  if(document.visibilityState==='hidden')saveView();
   if(document.visibilityState==='visible'&&D.loaded&&Date.now()-(D.liveAt||D.loaded)>30*60*1000)loadDiscover(true);
 });
 })();
